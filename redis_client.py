@@ -1,4 +1,7 @@
+import base64
+import json
 import os
+import time
 from base64 import b64decode, b64encode
 from typing import Optional
 
@@ -22,6 +25,7 @@ class RedisClient:
         self.public_keys_key = "secure_msg:public_keys"
         self.private_keys_key = "secure_msg:private_keys"
         self.shared_secrets_key = "secure_msg:shared_secrets"
+        self.messages_key_prefix = "secure_msg:messages:"
 
     async def store_public_key(self, client_id: str, public_key: int):
         """Store public key in Redis."""
@@ -57,14 +61,39 @@ class RedisClient:
         secret = await self.redis.hget(self.shared_secrets_key, key)
         return b64decode(secret) if secret else None
 
-    async def cleanup_client(self, client_id: str):
-        """Remove all data for a client."""
-        await self.redis.hdel(self.public_keys_key, client_id)
-        await self.redis.hdel(self.private_keys_key, client_id)
+    async def store_message(self, sender_id: str, recipient_id: str, encrypted_message: dict):
+        """Store encrypted message in Redis."""
+        message_data = {
+            'sender': sender_id,
+            'recipient': recipient_id,
+            'timestamp': int(time.time()),
+            'message': encrypted_message
+        }
+        # Create conversation key - sort IDs to ensure consistent key regardless of sender/recipient
+        conv_key = f"{self.messages_key_prefix}{min(sender_id, recipient_id)}:{max(sender_id, recipient_id)}"
+        # Encode the shared_key to base64 string
+        message_data['message']['shared_key'] = base64.b64encode(message_data['message']['shared_key']).decode('utf-8')
 
-        # Clean up shared secrets
-        all_secrets = await self.redis.hgetall(self.shared_secrets_key)
-        for key in all_secrets:
-            key = key.decode()
-            if key.startswith(f"{client_id}:") or key.endswith(f":{client_id}"):
-                await self.redis.hdel(self.shared_secrets_key, key)
+        # Store message
+        await self.redis.rpush(conv_key, json.dumps(message_data))
+        print(f"Stored message in {conv_key}")
+        # Expire conversation key after 30 days
+        await self.redis.expire(conv_key, 2592000)
+
+    async def get_messages(self, client_id: str, peer_id: Optional[str] = None) -> list[dict]:
+        """Retrieve messages between client and peer or all messages for the client."""
+        if peer_id:
+            # Create conversation key using sorted IDs for consistency
+            conv_key = f"{self.messages_key_prefix}{min(client_id, peer_id)}:{max(client_id, peer_id)}"
+            # Get all messages for this conversation
+            messages = await self.redis.lrange(conv_key, 0, -1)
+            return [json.loads(msg.decode()) for msg in messages]
+        else:
+            # Retrieve all conversation keys for the client
+            pattern = f"{self.messages_key_prefix}*{client_id}*"
+            keys = await self.redis.keys(pattern)
+            all_messages = []
+            for key in keys:
+                messages = await self.redis.lrange(key, 0, -1)
+                all_messages.extend([json.loads(msg.decode()) for msg in messages])
+            return all_messages
