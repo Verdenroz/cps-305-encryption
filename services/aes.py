@@ -20,6 +20,7 @@ def encrypt_message(message: str, key: bytes) -> dict:
     return {
         'iv': b64encode(iv).decode('utf-8'),
         'ciphertext': b64encode(ct_bytes).decode('utf-8'),
+        'shared_key': key,
         'hash': message_hash
     }
 
