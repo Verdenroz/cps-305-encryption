@@ -1,7 +1,7 @@
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from redis_client import RedisClient
@@ -25,6 +25,25 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+
+@app.get("/messages/{client_id}")
+async def get_messages(client_id: str, peer: Optional[str] = Query(None)):
+    global messages_service
+
+    return await messages_service.get_messages(client_id, peer)
+
+@app.post("/send")
+async def send_message(message: dict):
+    global messages_service
+
+    client_id = message.get('sender')
+    recipient_id = message.get('content')['recipient']
+    await messages_service.initialize_secure_channel(client_id)
+    await messages_service.initialize_secure_channel(recipient_id)
+
+    status = await messages_service.send_message(client_id, message['content'])
+    return {"status": status}
 
 
 @app.websocket("/ws/{client_id}")
@@ -51,7 +70,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
         try:
             while True:
                 message = await websocket.receive_json()
-                await messages_service.handle_message(websocket, client_id, message)
+                await messages_service.handle_message(client_id, message, websocket)
 
         except WebSocketDisconnect:
             pass
@@ -60,4 +79,3 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
         # Cleanup on disconnect
         if client_id in messages_service.connections:
             del messages_service.connections[client_id]
-        await redis.cleanup_client(client_id)
