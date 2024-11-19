@@ -1,109 +1,101 @@
-from typing import Optional
+import os
+import time
+from typing import Optional, Tuple
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+import base64
 
-from starlette.websockets import WebSocket, WebSocketState
-
-from redis_client import RedisClient
-from services.aes import encrypt_message
-from services.keys import generate_keypair, generate_shared_secret
+from redis_client import SecureRedisClient, StoredMessage
 
 
 class MessageService:
-    def __init__(self, redis: RedisClient):
-        self.redis = redis
-        self.connections: dict[str: WebSocket] = {}
+    def __init__(self, redis_client: SecureRedisClient):
+        self.redis = redis_client
+        self.active_sessions = {}  # client_id -> (private_key, public_key)
+        self.shared_secrets = {}  # session_id -> shared_secret
 
-    async def initialize_secure_channel(self, client_id: str) -> tuple[int, int]:
-        """Initialize secure channel by generating and storing keypair if not already present."""
-        # Check if keys already exist
-        private_key = await self.redis.get_private_key(client_id)
-        public_key = await self.redis.get_public_key(client_id)
+    def generate_dh_keypair(self) -> Tuple[int, int]:
+        """Generate DH keypair for the server."""
+        # Use the same prime as frontend
+        p = int(
+            'FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3DC2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F83655D23DCA3AD961C62F356208552BB9ED529077096966D670C354E4ABC9804F1746C08CA18217C32905E462E36CE3BE39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9DE2BCBF6955817183995497CEA956AE515D2261898FA051015728E5A8AACAA68FFFFFFFFFFFFFFFF',
+            16)
+        g = 2
 
-        if private_key and public_key:
-            print(f"Keys already exist for client {client_id}")
-            return private_key, public_key
+        # Generate private key
+        private_key = int.from_bytes(os.urandom(32), 'big')
+        # Calculate public key
+        public_key = pow(g, private_key, p)
 
-        # Generate and store new keypair
-        private_key, public_key = generate_keypair()
-        await self.redis.store_private_key(client_id, private_key)
-        await self.redis.store_public_key(client_id, public_key)
-        print(f"Generated new keys for client {client_id}")
         return private_key, public_key
 
-    async def establish_shared_secret(self, client_id: str, peer_id: str) -> bytes:
-        """Establish shared secret between two clients."""
-        # Get our private key and peer's public key
-        private_key = await self.redis.get_private_key(client_id)
-        peer_public_key = await self.redis.get_public_key(peer_id)
-        if not private_key or not peer_public_key:
-            raise ValueError("Missing keys for secure channel")
+    async def initialize_secure_channel(self, client_id: str, client_public_key: str) -> Tuple[str, str]:
+        """Initialize secure channel with client and return session ID."""
+        private_key, public_key = self.generate_dh_keypair()
 
-        # Generate and store shared secret
-        shared_secret = generate_shared_secret(private_key, peer_public_key)
-        await self.redis.store_shared_secret(client_id, peer_id, shared_secret)
-        return shared_secret
+        # Store keypair
+        self.active_sessions[client_id] = (private_key, public_key)
 
-    async def handle_message(self, sender_id: str, message_data: dict, websocket: Optional[WebSocket] = None):
-        """Handle incoming messages."""
-        try:
-            recipient_id = message_data.get('recipient')
-            message_content = message_data.get('message')
-            if not recipient_id or not message_content:
-                if websocket:
-                    await websocket.send_json({
-                        'error': 'Invalid message format. Need recipient and message.'
-                    })
-                return {
-                    'error': 'Invalid message format. Need recipient and message.'
-                }
-            print(f"Received message from {sender_id} to {recipient_id}: {message_content}")
-            # Get or establish shared secret
-            shared_secret = await self.redis.get_shared_secret(sender_id, recipient_id)
-            if not shared_secret:
-                try:
-                    shared_secret = await self.establish_shared_secret(sender_id, recipient_id)
-                except ValueError as e:
-                    if websocket:
-                        await websocket.send_json({
-                            'error': f'Failed to establish secure channel: {str(e)}'
-                        })
-                    return {
-                        'error': f'Failed to establish secure channel: {str(e)}'
-                    }
+        # Compute shared secret
+        p = int(
+            'FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3DC2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F83655D23DCA3AD961C62F356208552BB9ED529077096966D670C354E4ABC9804F1746C08CA18217C32905E462E36CE3BE39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9DE2BCBF6955817183995497CEA956AE515D2261898FA051015728E5A8AACAA68FFFFFFFFFFFFFFFF',
+            16)
 
-            # Encrypt message
-            encrypted_data = encrypt_message(message_content, shared_secret)
-            print(f"Encrypted message: {encrypted_data}")
+        client_public_key_int = int(client_public_key)
+        shared_secret_int = pow(client_public_key_int, private_key, p)
 
-            # Send to recipient if online
-            recipient_ws = self.connections.get(recipient_id)
-            if recipient_ws and recipient_ws.client_state == WebSocketState.CONNECTED:
-                await recipient_ws.send_json({
-                    'type': 'message',
-                    'recipient': recipient_id,
-                    'sender': sender_id,
-                    'message': encrypted_data
-                })
-            else:
-                # Store message in Redis
-                await self.redis.store_message(sender_id, recipient_id, encrypted_data)
+        # Derive final key using HKDF
+        hkdf = HKDF(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=None,
+            info=b'handshake data',
+        )
+        shared_secret = hkdf.derive(shared_secret_int.to_bytes((shared_secret_int.bit_length() + 7) // 8, 'big'))
 
-            return {
-                'status': 'success'
-            }
+        # Create and store session
+        session_id = f"session_{client_id}_{int(time.time())}"
+        self.shared_secrets[session_id] = shared_secret
+        await self.redis.store_session(session_id, client_id, shared_secret)
 
-        except Exception as e:
-            if websocket:
-                await websocket.send_json({
-                    'error': f'Error processing message: {str(e)}'
-                })
-            return {
-                'error': f'Error processing message: {str(e)}'
-            }
+        return session_id, str(public_key)
+
+    async def handle_message(self, client_id: str, message_data: dict):
+        """Handle incoming encrypted message."""
+        encrypted_content = base64.b64decode(message_data['encrypted'])
+        iv = base64.b64decode(message_data['iv'])
+        session_id = message_data['session_id']
+        recipient_id = message_data['recipient']
+
+        # Store message
+        await self.redis.store_message(
+            StoredMessage(
+                sender_id=client_id,
+                recipient_id=recipient_id,
+                encrypted_content=encrypted_content,
+                iv=iv,
+                session_id=session_id,
+                timestamp=int(time.time())
+            )
+        )
+
+        return {"status": "success"}
 
     async def get_messages(self, client_id: str, peer_id: Optional[str] = None) -> list[dict]:
-        """Get and encrypted messages between client and peer."""
-        return await self.redis.get_messages(client_id, peer_id)
+        """Retrieve messages between client and peer or all messages for the client."""
+        messages = await self.redis.get_messages(client_id, peer_id)
 
-    async def send_message(self, client_id: str, message: dict):
-        """Send an encrypted message to a peer."""
-        await self.handle_message(client_id, message)
+        # Encode byte fields to base64
+        encoded_messages = []
+        for message in messages:
+            encoded_messages.append({
+                'sender_id': message.sender_id,
+                'recipient_id': message.recipient_id,
+                'encrypted_content': base64.b64encode(message.encrypted_content).decode('utf-8'),
+                'iv': base64.b64encode(message.iv).decode('utf-8'),
+                'session_id': message.session_id,
+                'timestamp': message.timestamp
+            })
+
+        return encoded_messages

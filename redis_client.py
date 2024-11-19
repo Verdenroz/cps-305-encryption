@@ -2,15 +2,25 @@ import base64
 import json
 import os
 import time
-from base64 import b64decode, b64encode
 from typing import Optional
-
+from dataclasses import dataclass
+from cryptography.fernet import Fernet
 from dotenv import load_dotenv
 from redis import asyncio as aioredis
 
+
+@dataclass
+class StoredMessage:
+    sender_id: str
+    recipient_id: str
+    encrypted_content: bytes
+    iv: bytes
+    session_id: str
+    timestamp: int
+
 load_dotenv()
 
-class RedisClient:
+class SecureRedisClient:
     def __init__(self):
         self.redis = aioredis.Redis(
             connection_pool=aioredis.ConnectionPool(
@@ -22,78 +32,99 @@ class RedisClient:
             ),
             single_connection_client=True,
         )
-        self.public_keys_key = "secure_msg:public_keys"
-        self.private_keys_key = "secure_msg:private_keys"
-        self.shared_secrets_key = "secure_msg:shared_secrets"
+        # Keys for different types of data
+        self.sessions_key = "secure_msg:sessions:"
         self.messages_key_prefix = "secure_msg:messages:"
 
-    async def store_public_key(self, client_id: str, public_key: int):
-        """Store public key in Redis."""
-        await self.redis.hset(self.public_keys_key, client_id, str(public_key))
+        # Master key for encrypting session keys
+        # In production, this should be securely managed (e.g., using a KMS)
+        self.master_key = Fernet(os.environ.get('MASTER_KEY', Fernet.generate_key()))
 
-    async def get_public_key(self, client_id: str) -> Optional[int]:
-        """Retrieve public key from Redis."""
-        key = await self.redis.hget(self.public_keys_key, client_id)
-        return int(key) if key else None
+    async def store_session(self, session_id: str, client_id: str, shared_secret: bytes):
+        """Store an encrypted session key in Redis."""
+        # Encrypt the session key before storing
+        encrypted_secret = self.master_key.encrypt(shared_secret)
 
-    async def store_private_key(self, client_id: str, private_key: int):
-        """Store private key in Redis."""
-        await self.redis.hset(self.private_keys_key, client_id, str(private_key))
+        session_data = {
+            'client_id': client_id,
+            'created_at': int(time.time()),
+            'secret': base64.b64encode(encrypted_secret).decode('utf-8')
+        }
 
-    async def get_private_key(self, client_id: str) -> Optional[int]:
-        """Retrieve private key from Redis."""
-        key = await self.redis.hget(self.private_keys_key, client_id)
-        return int(key) if key else None
-
-    async def store_shared_secret(self, client_id: str, peer_id: str, shared_secret: bytes):
-        """Store shared secret in Redis."""
-        key = f"{client_id}:{peer_id}"
+        # Store session data
         await self.redis.hset(
-            self.shared_secrets_key,
-            key,
-            b64encode(shared_secret).decode()
+            f"{self.sessions_key}{client_id}",
+            session_id,
+            json.dumps(session_data)
         )
-        await self.redis.hexpire(self.shared_secrets_key,3600, key)
 
-    async def get_shared_secret(self, client_id: str, peer_id: str) -> Optional[bytes]:
-        """Retrieve shared secret from Redis."""
-        key = f"{client_id}:{peer_id}"
-        secret = await self.redis.hget(self.shared_secrets_key, key)
-        return b64decode(secret) if secret else None
+        # Set expiry for 30 days
+        await self.redis.expire(f"{self.sessions_key}{client_id}", 2592000)
 
-    async def store_message(self, sender_id: str, recipient_id: str, encrypted_message: dict):
+    async def get_session(self, session_id: str, client_id: str) -> Optional[bytes]:
+        """Retrieve and decrypt a session key from Redis."""
+        session_data = await self.redis.hget(
+            f"{self.sessions_key}{client_id}",
+            session_id
+        )
+
+        if not session_data:
+            return None
+
+        try:
+            data = json.loads(session_data)
+            encrypted_secret = base64.b64decode(data['secret'])
+            return self.master_key.decrypt(encrypted_secret)
+        except Exception as e:
+            print(f"Error decrypting session key: {e}")
+            return None
+
+    async def store_message(self, message: StoredMessage):
         """Store encrypted message in Redis."""
         message_data = {
-            'sender': sender_id,
-            'recipient': recipient_id,
-            'timestamp': int(time.time()),
-            'message': encrypted_message
+            'sender': message.sender_id,
+            'recipient': message.recipient_id,
+            'encrypted_content': base64.b64encode(message.encrypted_content).decode('utf-8'),
+            'iv': base64.b64encode(message.iv).decode('utf-8'),
+            'session_id': message.session_id,
+            'timestamp': message.timestamp
         }
-        # Create conversation key - sort IDs to ensure consistent key regardless of sender/recipient
-        conv_key = f"{self.messages_key_prefix}{min(sender_id, recipient_id)}:{max(sender_id, recipient_id)}"
-        # Encode the shared_key to base64 string
-        message_data['message']['shared_key'] = base64.b64encode(message_data['message']['shared_key']).decode('utf-8')
+
+        # Create conversation key - sort IDs to ensure consistent key
+        conv_key = f"{self.messages_key_prefix}{min(message.sender_id, message.recipient_id)}:{max(message.sender_id, message.recipient_id)}"
 
         # Store message
         await self.redis.rpush(conv_key, json.dumps(message_data))
-        print(f"Stored message in {conv_key}")
-        # Expire conversation key after 30 days
+
+        # Set expiry for 30 days
         await self.redis.expire(conv_key, 2592000)
 
-    async def get_messages(self, client_id: str, peer_id: Optional[str] = None) -> list[dict]:
+    async def get_messages(self, client_id: str, peer_id: Optional[str] = None) -> list[StoredMessage]:
         """Retrieve messages between client and peer or all messages for the client."""
         if peer_id:
-            # Create conversation key using sorted IDs for consistency
+            # Get messages for specific conversation
             conv_key = f"{self.messages_key_prefix}{min(client_id, peer_id)}:{max(client_id, peer_id)}"
-            # Get all messages for this conversation
             messages = await self.redis.lrange(conv_key, 0, -1)
-            return [json.loads(msg.decode()) for msg in messages]
         else:
-            # Retrieve all conversation keys for the client
+            # Get all messages for client
             pattern = f"{self.messages_key_prefix}*{client_id}*"
             keys = await self.redis.keys(pattern)
-            all_messages = []
+            messages = []
             for key in keys:
-                messages = await self.redis.lrange(key, 0, -1)
-                all_messages.extend([json.loads(msg.decode()) for msg in messages])
-            return all_messages
+                msgs = await self.redis.lrange(key, 0, -1)
+                messages.extend(msgs)
+
+        # Convert stored messages to StoredMessage objects
+        result = []
+        for msg in messages:
+            data = json.loads(msg.decode())
+            result.append(StoredMessage(
+                sender_id=data['sender'],
+                recipient_id=data['recipient'],
+                encrypted_content=base64.b64decode(data['encrypted_content']),
+                iv=base64.b64decode(data['iv']),
+                session_id=data['session_id'],
+                timestamp=data['timestamp']
+            ))
+
+        return result

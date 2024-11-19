@@ -1,13 +1,13 @@
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, HTTPException
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
-from redis_client import RedisClient
+from redis_client import SecureRedisClient
 from services.messages import MessageService
 
-redis: Optional[RedisClient] = None
+redis: Optional[SecureRedisClient] = None
 messages_service: Optional[MessageService] = None
 
 
@@ -16,7 +16,7 @@ async def lifespan(app: FastAPI):
     global redis
     global messages_service
     # Initialize Redis connection
-    redis = RedisClient()
+    redis = SecureRedisClient()
     messages_service = MessageService(redis)
 
     yield
@@ -33,17 +33,63 @@ async def get_messages(client_id: str, peer: Optional[str] = Query(None)):
 
     return await messages_service.get_messages(client_id, peer)
 
+
 @app.post("/send")
 async def send_message(message: dict):
+    """Handle sending encrypted messages between clients."""
     global messages_service
 
-    client_id = message.get('sender')
-    recipient_id = message.get('content')['recipient']
-    await messages_service.initialize_secure_channel(client_id)
-    await messages_service.initialize_secure_channel(recipient_id)
+    try:
+        # Extract required fields
+        client_id = message.get('sender')
+        if not client_id:
+            raise HTTPException(status_code=400, detail="Missing sender ID")
 
-    status = await messages_service.send_message(client_id, message['content'])
-    return {"status": status}
+        # Required fields
+        if not all([message.get('recipient'), message.get('encrypted'), message.get('iv'), message.get('session_id')]):
+            raise HTTPException(status_code=400, detail="Missing required message fields")
+
+        # Handle the encrypted message
+        result = await messages_service.handle_message(client_id, message)
+
+        return {"status": "success", "message_id": result.get("message_id", "")}
+
+    except ValueError as e:
+        print(e)
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        print(e)
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@app.post("/exchange")
+async def initialize_connection(body: dict):
+    """Initialize secure channel and exchange keys with client."""
+    global messages_service
+
+    try:
+        # Validate required fields
+        client_id = body.get('clientId')
+        client_public_key = body.get('publicKey')
+
+        if not client_id or not client_public_key:
+            raise HTTPException(status_code=400, detail="Missing client ID or public key")
+
+        # Initialize secure channel and get session details
+        session_id, server_public_key = await messages_service.initialize_secure_channel(
+            client_id,
+            client_public_key
+        )
+
+        return {
+            "sessionId": session_id,
+            "serverPublicKey": server_public_key
+        }
+
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Failed to initialize secure channel")
 
 
 @app.websocket("/ws/{client_id}")
